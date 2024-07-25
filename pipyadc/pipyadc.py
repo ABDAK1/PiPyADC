@@ -37,6 +37,52 @@ class ADS1256():
     # Register/Configuration Flag settings are initialized, but these
     # can be changed during runtime via class properties.
     # Default config is read from external file (module).
+    # def __init__(self, conf=ADS1256_default_config, pi=None):
+    #     # Set up the pigpio object if not provided as an argument
+    #     if pi is None:
+    #         self.pi = pigpio.pi()
+    #         print(self.pi)
+    #         self.created_pigpio = True
+    #     else:
+    #         self.pi = pi
+    #         self.created_pigpio = False
+    #     if not self.pi.connected:
+    #         raise IOError("Could not connect to hardware via pigpio library")
+    #     # This is not needed for any function currently implemented here,
+    #     # but the attribute is kept for user code which relys on the value
+    #     self.v_ref = conf.v_ref
+    #     # Following constants are for the bit-banging funcionality and for
+    #     # timing specifics of the ADS1256 chip
+    #     self._DRDY_TIMEOUT = conf.DRDY_TIMEOUT
+    #     self._DRDY_DELAY = conf.DRDY_DELAY
+    #     # ADS1255/ADS1256 command timing specifications.
+    #     # Delay between requesting data and reading the bus for
+    #     # RDATA, RDATAC and RREG commands (datasheet: t_6 >= 50*CLKIN period).
+    #     self._DATA_TIMEOUT = 1E-6 + 50/conf.CLKIN_FREQUENCY
+    #     # Command-to-command timeout after SYNC and RDATAC
+    #     # commands (datasheet: t11)
+    #     self._SYNC_TIMEOUT = 1E-6 + 24/conf.CLKIN_FREQUENCY
+    #     # See datasheet ADS1256: CS needs to remain low
+    #     # for t_10 = 8*T_CLKIN after last SCLK falling edge of a command.
+    #     # Because this delay is longer than timeout t_11 for the
+    #     # RREG, WREG and RDATA commands of 4*T_CLKIN, we do not need
+    #     # the extra t_11 timeout for these commands when using software
+    #     # chip select selection and the _CS_TIMEOUT.
+    #     self._CS_TIMEOUT = 1E-6 + 8/conf.CLKIN_FREQUENCY
+    #     # When using hardware/hard-wired chip select, still a command-
+    #     # to command timeout of t_11 is needed as a minimum for the
+    #     # RREG, WREG and RDATA commands.
+    #     self._T_11_TIMEOUT = 1E-6 + 4/conf.CLKIN_FREQUENCY
+    #     self.configure_gpios(conf)
+    #     self.configure_spi(conf)
+    #     # Device reset for defined initial state
+    #     if conf.CHIP_HARD_RESET_ON_START:
+    #         self.hard_reset()
+    #     else:
+    #         self.reset()
+    #     self.preset_adc_registers(conf)
+    #     self.check_chip_id()
+    """ Start RDATAC """
     def __init__(self, conf=ADS1256_default_config, pi=None):
         # Set up the pigpio object if not provided as an argument
         if pi is None:
@@ -82,7 +128,74 @@ class ADS1256():
             self.reset()
         self.preset_adc_registers(conf)
         self.check_chip_id()
+        # Configure DRDY pin
+        self.drdy_pin = conf.DRDY_PIN
+        self.pi.set_mode(self.drdy_pin, pigpio.INPUT)
 
+    def _send_command(self, cmd):
+        self.spi_write([cmd])
+
+    def start_rdatac(self):
+        """Send the RDATAC command to the ADC."""
+        self.wait_for_drdy()  # Wait until DRDY goes low
+        self._send_command(self.CMD_RDATAC)
+        time.sleep(self._SYNC_TIMEOUT)  # Wait for t6 time
+
+    def stop_rdatac(self):
+        """Send the SDATAC command to stop RDATAC mode."""
+        self._send_command(self.CMD_SDATAC)
+
+    def set_channel(self, diff_channel):
+        """Set the input multiplexer to the desired differential channel."""
+        self._send_command(self.CMD_SYNC)
+        self.spi_write([self.CMD_WREG | self.REG_MUX, 0x00, diff_channel])
+        time.sleep(self._SYNC_TIMEOUT)  # Wait for t6 time
+
+    def read_data_stream(self, callback, sample_rate=30000, diff_channel=0x00):
+        """
+        Generator to read data continuously from the ADC at the specified sample rate.
+        Calls the provided callback function with each data sample.
+        
+        :param callback: Function to call with each data sample
+        :param sample_rate: Target sample rate in samples per second
+        :param diff_channel: Differential channel to read from
+        """
+        self.set_channel(diff_channel)  # Set the channel before starting
+        self.start_rdatac()
+        try:
+            sample_interval = 1.0 / sample_rate
+            next_sample_time = time.time()
+            while True:
+                current_time = time.time()
+                if current_time >= next_sample_time:
+                    data = self.read_data()
+                    callback(data)
+                    next_sample_time += sample_interval
+                else:
+                    time.sleep(next_sample_time - current_time)
+        except KeyboardInterrupt:
+            # Stop reading on user interrupt (Ctrl+C)
+            pass
+        finally:
+            self.stop_rdatac()
+
+    def read_data(self):
+        """Read a single data sample from the ADC."""
+        self.wait_for_drdy()
+        raw_data = self.spi_read(3)
+        result = (raw_data[0] << 16) | (raw_data[1] << 8) | raw_data[2]
+        if result & 0x800000:  # If the result is negative
+            result -= 0x1000000
+        return result
+
+    def wait_for_drdy(self):
+        """Wait for DRDY pin to go low indicating data is ready."""
+        timeout = time.time() + self._DRDY_TIMEOUT
+        while self.pi.read(self.drdy_pin):
+            if time.time() > timeout:
+                raise RuntimeError("Timeout waiting for DRDY to go low")
+            time.sleep(0.001)
+    """ Stop RDATAC """
     def __enter__(self):
         return self
 
